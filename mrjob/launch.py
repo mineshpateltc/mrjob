@@ -250,6 +250,11 @@ class MRJobLauncher(object):
             help='show Hadoop-related options')
 
         self.option_parser.add_option(
+            '--help-qubole', dest='help_qubole', action='store_true',
+            default=False,
+            help='show Qubole-related options')
+
+        self.option_parser.add_option(
             '--help-runner', dest='help_runner', action='store_true',
             default=False, help='show runner-related options')
 
@@ -315,7 +320,8 @@ class MRJobLauncher(object):
     def all_option_groups(self):
         return (self.option_parser, self.proto_opt_group,
                 self.runner_opt_group, self.hadoop_emr_opt_group,
-                self.emr_opt_group, self.hadoop_opts_opt_group)
+                self.qubole_opt_group, self.emr_opt_group,
+                self.hadoop_opts_opt_group)
 
     def is_mapper_or_reducer(self):
         """True if this is a mapper/reducer.
@@ -428,6 +434,11 @@ class MRJobLauncher(object):
         if self.options.help_hadoop:
             print_help_for_groups(self.hadoop_emr_opt_group,
                                   self.hadoop_opts_opt_group)
+            sys.exit(0)
+
+        if self.options.help_qubole:
+            print_help_for_groups(self.hadoop_emr_opt_group,
+                                  self.qubole_opt_group)
             sys.exit(0)
 
         if self.options.help_runner:
