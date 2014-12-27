@@ -94,6 +94,7 @@ from mrjob.util import shlex_split
 
 # Qubole Python SDK: https://github.com/qubole/qds-sdk-py
 from qds_sdk.commands import *
+from qds_sdk.cluster import *
 QUBOLE_HADOOP_VERSION = '0.20.1-dev'
 QUBOLE_POLL_TIME = 6
 QUBOLE_ANALYZE_URL = 'https://api.qubole.com/v2/analyze?command_id='
@@ -178,8 +179,15 @@ class QuboleRunnerOptionStore(RunnerOptionStore):
         'aws_access_key_id',
         'aws_secret_access_key',
         'api_token',
+        'create_cluster',
+        'master_instance_type',
+        'slave_instance_type',
+        'initial_nodes',
+        'max_nodes',
+        'slave_request_type',
         'api_version',
         'cluster_label',
+        'node_bootstrap_name',
         'ami_version',
         'aws_availability_zone',
         'aws_region',
@@ -311,12 +319,12 @@ class QuboleJobRunner(MRJobRunner):
         #         'file', path, must_name='bootstrap_files'))
 
         self._bootstrap = self._parse_bootstrap()
-        # # self._legacy_bootstrap = self._parse_legacy_bootstrap()
+        self._legacy_bootstrap = self._parse_legacy_bootstrap()
 
-        # for cmd in self._bootstrap + self._legacy_bootstrap:
-        #     for maybe_path_dict in cmd:
-        #         if isinstance(maybe_path_dict, dict):
-        #             self._bootstrap_dir_mgr.add(**maybe_path_dict)
+        for cmd in self._bootstrap + self._legacy_bootstrap:
+            for maybe_path_dict in cmd:
+                if isinstance(maybe_path_dict, dict):
+                    self._bootstrap_dir_mgr.add(**maybe_path_dict)
 
         # where our own logs ended up (we'll find this out once we run the job)
         self._s3_job_log_uri = None
@@ -505,6 +513,8 @@ class QuboleJobRunner(MRJobRunner):
     def _prepare_for_launch(self):
         self._check_input_exists()
         self._check_output_not_exists()
+        self._configure_qubole_connection() # moved this to here from _launch_qubole_job
+        self._set_qubole_default_location()
         self._create_setup_wrapper_script() # To get --setup version working
         self._add_bootstrap_files_for_upload()
         self._add_job_files_for_upload()
@@ -545,9 +555,9 @@ class QuboleJobRunner(MRJobRunner):
         persistent -- set by make_persistent_job_flow()
         """
         # lazily create mrjob.tar.gz
-        # if self._opts['bootstrap_mrjob']:
-        #     self._create_mrjob_tar_gz()
-        #     self._bootstrap_dir_mgr.add('file', self._mrjob_tar_gz_path)
+        if self._opts['bootstrap_mrjob']:
+             self._create_mrjob_tar_gz()
+             self._bootstrap_dir_mgr.add('file', self._mrjob_tar_gz_path)
 
         # all other files needed by the script are already in
         # _bootstrap_dir_mgr
@@ -556,11 +566,12 @@ class QuboleJobRunner(MRJobRunner):
 
         # # now that we know where the above files live, we can create
         # # the master bootstrap script
-        # self._create_master_bootstrap_script_if_needed()
-        # if self._master_bootstrap_script_path:
+        self._create_master_bootstrap_script_if_needed()
+        if self._master_bootstrap_script_path:
         #     self._upload_mgr.add(self._master_bootstrap_script_path)
+              self._qubole_default_upload_mgr.add(self._master_bootstrap_script_path)
 
-        # # make sure bootstrap action scripts are on S3
+        # make sure bootstrap action scripts are on S3
         # for bootstrap_action in self._bootstrap_actions:
         #     self._upload_mgr.add(bootstrap_action['path'])
 
@@ -594,6 +605,12 @@ class QuboleJobRunner(MRJobRunner):
         s3_conn = self.make_s3_conn()
 
         for path, s3_uri in self._upload_mgr.path_to_uri().iteritems():
+            log.debug('uploading %s -> %s' % (path, s3_uri))
+            s3_key = self.make_s3_key(s3_uri, s3_conn)
+            s3_key.set_contents_from_filename(path)
+
+        # Upload qubole node_bootstrap.sh file as well
+        for path, s3_uri in self._qubole_default_upload_mgr.path_to_uri().iteritems():
             log.debug('uploading %s -> %s' % (path, s3_uri))
             s3_key = self.make_s3_key(s3_uri, s3_conn)
             s3_key.set_contents_from_filename(path)
@@ -676,10 +693,7 @@ class QuboleJobRunner(MRJobRunner):
         steps we want to run."""
         # quick, add the other steps before the job spins up and
         # then shuts itself down (in practice this takes several minutes)
-        steps = [self._build_step(n) for n in xrange(self._num_steps())]
-        if self._bootstrap:
-            steps.insert(0,self._build_shell_step(self._bootstrap))
-        return steps
+        return [self._build_step(n) for n in xrange(self._num_steps())]
 
     def _build_step(self, step_num):
         step = self._get_step(step_num)
@@ -787,14 +801,56 @@ class QuboleJobRunner(MRJobRunner):
     def _configure_qubole_connection(self):
         Qubole.configure(api_token=self._opts['api_token'], version=self._opts['api_version'])
 
+    def _set_qubole_default_location(self):
+        from qds_sdk.account import *
+        import json
+        acc = Account.find()
+        json_acc = json.loads(str(acc))
+        default_location = json_acc['storage_location']
+
+        # Qubole node_bootstrap stuff:
+        # set the Qubole default storage location. This is where the node_bootstrap file needs to go:
+        node_bootstrap_loc = 's3://%s/scripts/hadoop/' % (default_location)
+        self._qubole_default_upload_mgr = UploadDirManager(node_bootstrap_loc)
+
+
+    def _create_qubole_cluster(self):
+        # <todo> flag for ganglia monitoring
+        cluster_info = ClusterInfo(label=self._opts['cluster_label'],
+                                   aws_access_key_id=self._opts['aws_access_key_id'],
+                                   aws_secret_access_key=self._opts['aws_secret_access_key'])
+        # <todo> handle custom_config (hadoop overrides), handle slave_request_type
+        cluster_info.set_hadoop_settings(master_instance_type=self._opts['master_instance_type'],
+                                         slave_instance_type=self._opts['slave_instance_type'],
+                                         initial_nodes=self._opts['initial_nodes'], max_nodes=self._opts['max_nodes'])
+        cluster_info.set_ec2_settings(aws_region=self._opts['aws_region'])
+
+        # Need to upload the node bootstrap file to the same location:
+        # 's3://%s/scripts/hadoop/%s' % (self._opts['default_location'], self._opts['node_bootstrap_name']
+        cluster_info.node_bootstrap_file = self._opts['node_bootstrap_name']
+
+        #<todo: spot support>
+        # cluster_info.set_spot_instance_settings(maximum_bid_price_percentage='120', timeout_for_request='15')
+        # cluster_info.set_security_settings(persistent_security_groups='ElasticMapReduce-slave')
+
+        payload = cluster_info.minimal_payload()
+        return Cluster.create(payload)
+
     def _launch_qubole_job(self):
-        """Create ..."""
         self._create_s3_temp_bucket_if_needed()
-        self._configure_qubole_connection()
+
+        """ Create a Qubole cluster configuration if required """
+        if self._opts['create_cluster'] is True:
+            log.info("Creating new Qubole cluster: %s" % self._opts['cluster_label'])
+            self._create_qubole_cluster()
+        else:
+            log.info("Reusing existing %s" % self._opts['cluster_label'])
+
         steps = self._build_steps()
 
         """ Creating a Qubole Workflow Command (aka: CompositeCommand) ... """
         composite = CompositeCommand.compose(steps, cluster_label=self._opts['cluster_label'], notify=False, name=self._job_name)
+        log.info("### DEBUG - composite: %s" % composite)
         composite_command = CompositeCommand.create(**composite)
         # CompositeCommand.run(**composite)
         self._qubole_job_start = time.time()
@@ -856,68 +912,74 @@ class QuboleJobRunner(MRJobRunner):
                 self._job_name, step_num + 1)
 
     ### Bootstrapping ###
-    # Bootstrap script is not created. Instead, a shell command is executed as first step in workflow if we use the --qubole-bootstrap command
-    # def _create_master_bootstrap_script_if_needed(self):
-    #     """Helper for :py:meth:`_add_bootstrap_files_for_upload`.
+    def _create_master_bootstrap_script_if_needed(self):
+        """Helper for :py:meth:`_add_bootstrap_files_for_upload`.
 
-    #     Create the master bootstrap script and write it into our local
-    #     temp directory. Set self._master_bootstrap_script_path.
+        Create the master bootstrap script and write it into our local
+        temp directory. Set self._master_bootstrap_script_path.
 
-    #     This will do nothing if there are no bootstrap scripts or commands,
-    #     or if it has already been called."""
-    #     if self._master_bootstrap_script_path:
-    #         return
+        This will do nothing if there are no bootstrap scripts or commands,
+        or if it has already been called."""
+        if self._master_bootstrap_script_path:
+            return
 
-    #     # don't bother if we're not starting a job flow
-    #     if self._opts['emr_job_flow_id']:
-    #         return
+        # don't bother if we aren't creating a new Qubole cluster
+        if not self._opts['create_cluster']:
+            return
 
-    #     # Also don't bother if we're not bootstrapping
-    #     if not (self._bootstrap or self._legacy_bootstrap or
-    #             self._opts['bootstrap_files']
-    #             or self._opts['bootstrap_mrjob']):
-    #         return
+        # Also don't bother if we're not bootstrapping
+        if not (self._bootstrap or self._legacy_bootstrap or
+                self._opts['bootstrap_files']
+                or self._opts['bootstrap_mrjob']):
+            return
 
-    #     # create mrjob.tar.gz if we need it, and add commands to install it
-    #     mrjob_bootstrap = []
-    #     if self._opts['bootstrap_mrjob']:
-    #         # _add_bootstrap_files_for_upload() should have done this
-    #         assert self._mrjob_tar_gz_path
-    #         path_dict = {
-    #             'type': 'file', 'name': None, 'path': self._mrjob_tar_gz_path}
-    #         self._bootstrap_dir_mgr.add(**path_dict)
+        # # create mrjob.tar.gz if we need it, and add commands to install it
+        # mrjob_bootstrap = []
+        # if self._opts['bootstrap_mrjob']:
+        #     # _add_bootstrap_files_for_upload() should have done this
+        #     assert self._mrjob_tar_gz_path
+        #     path_dict = {
+        #         'type': 'file', 'name': None, 'path': self._mrjob_tar_gz_path}
+        #     self._bootstrap_dir_mgr.add(**path_dict)
+        #
+        #     # find out where python keeps its libraries
+        #     mrjob_bootstrap.append([
+        #         "__mrjob_PYTHON_LIB=$(%s -c "
+        #         "'from distutils.sysconfig import get_python_lib;"
+        #         " print get_python_lib()')" %
+        #         cmd_line(self._opts['python_bin'])])
+        #     # un-tar mrjob.tar.gz
+        #     mrjob_bootstrap.append(
+        #         ['sudo tar xfz ', path_dict, ' -C $__mrjob_PYTHON_LIB'])
+        #     # re-compile pyc files now, since mappers/reducers can't
+        #     # write to this directory. Don't fail if there is extra
+        #     # un-compileable crud in the tarball (this would matter if
+        #     # sh_bin were 'sh -e')
+        #     mrjob_bootstrap.append(
+        #         ['sudo %s -m compileall -f $__mrjob_PYTHON_LIB/mrjob && true' %
+        #          cmd_line(self._opts['python_bin'])])
 
-    #         # find out where python keeps its libraries
-    #         mrjob_bootstrap.append([
-    #             "__mrjob_PYTHON_LIB=$(%s -c "
-    #             "'from distutils.sysconfig import get_python_lib;"
-    #             " print get_python_lib()')" %
-    #             cmd_line(self._opts['python_bin'])])
-    #         # un-tar mrjob.tar.gz
-    #         mrjob_bootstrap.append(
-    #             ['sudo tar xfz ', path_dict, ' -C $__mrjob_PYTHON_LIB'])
-    #         # re-compile pyc files now, since mappers/reducers can't
-    #         # write to this directory. Don't fail if there is extra
-    #         # un-compileable crud in the tarball (this would matter if
-    #         # sh_bin were 'sh -e')
-    #         mrjob_bootstrap.append(
-    #             ['sudo %s -m compileall -f $__mrjob_PYTHON_LIB/mrjob && true' %
-    #              cmd_line(self._opts['python_bin'])])
+        # In Qubole, just need to add "pip install --pre mrjob" to the node_bootstrap.sh file
+        mrjob_bootstrap = []
+        mrjob_bootstrap.append(["pip install --pre mrjob"])
 
-    #     # we call the script b.py because there's a character limit on
-    #     # bootstrap script names (or there was at one time, anyway)
-    #     path = os.path.join(self._get_local_tmp_dir(), 'b.py')
-    #     log.info('writing master bootstrap script to %s' % path)
+        path = os.path.join(self._get_local_tmp_dir(), self._opts['node_bootstrap_name'])
+        log.info('writing master bootstrap script to %s' % path)
 
-    #     contents = self._master_bootstrap_script_content(
-    #         self._bootstrap + mrjob_bootstrap + self._legacy_bootstrap)
-    #     for line in StringIO(contents):
-    #         log.debug('BOOTSTRAP: ' + line.rstrip('\r\n'))
+        # contents = self._master_bootstrap_script_content(
+        #     self._bootstrap + mrjob_bootstrap + self._legacy_bootstrap)
 
-    #     with open(path, 'w') as f:
-    #         f.write(contents)
+        # Just moving the order around to have the mrjob install first:
+        contents = self._master_bootstrap_script_content(
+            mrjob_bootstrap + self._bootstrap + self._legacy_bootstrap)
 
-    #     self._master_bootstrap_script_path = path
+        for line in StringIO(contents):
+            log.debug('BOOTSTRAP: ' + line.rstrip('\r\n'))
+
+        with open(path, 'w') as f:
+            f.write(contents)
+
+        self._master_bootstrap_script_path = path
 
     def _parse_bootstrap(self):
         """Parse the *bootstrap* option with
@@ -925,93 +987,93 @@ class QuboleJobRunner(MRJobRunner):
         """
         return [parse_setup_cmd(cmd) for cmd in self._opts['qubole_bootstrap']]
 
-    # def _parse_legacy_bootstrap(self):
-    #     """Parse the deprecated
-    #     options *bootstrap_python_packages*, and *bootstrap_cmds*
-    #     *bootstrap_scripts* as bootstrap commands, in that order.
+    def _parse_legacy_bootstrap(self):
+        """Parse the deprecated
+         options *bootstrap_python_packages*, and *bootstrap_cmds*
+         *bootstrap_scripts* as bootstrap commands, in that order.
 
-    #     This is a separate method from _parse_bootstrap() because bootstrapping
-    #     mrjob happens after the new bootstrap commands (so you can upgrade
-    #     Python) but before the legacy commands (for backwards compatibility).
-    #     """
-    #     bootstrap = []
+        This is a separate method from _parse_bootstrap() because bootstrapping
+        mrjob happens after the new bootstrap commands (so you can upgrade
+        Python) but before the legacy commands (for backwards compatibility).
+        """
+        bootstrap = []
 
-    #     # bootstrap_python_packages
-    #     if self._opts['bootstrap_python_packages']:
-    #         # 3.0.x AMIs use yum rather than apt-get;
-    #         # can't determine which AMI `latest` is at
-    #         # job flow creation time so we call both
-    #         bootstrap.append(['sudo apt-get install -y python-pip || '
-    #             'sudo yum install -y python-pip'])
+        # bootstrap_python_packages
+        if self._opts['bootstrap_python_packages']:
+            # 3.0.x AMIs use yum rather than apt-get;
+            # can't determine which AMI `latest` is at
+            # job flow creation time so we call both
+            bootstrap.append(['sudo apt-get install -y python-pip || '
+                'sudo yum install -y python-pip'])
 
-    #     for path in self._opts['bootstrap_python_packages']:
-    #         path_dict = parse_legacy_hash_path('file', path)
-    #         # don't worry about inspecting the tarball; pip is smart
-    #         # enough to deal with that
-    #         bootstrap.append(['sudo pip install ', path_dict])
+        for path in self._opts['bootstrap_python_packages']:
+            path_dict = parse_legacy_hash_path('file', path)
+            # don't worry about inspecting the tarball; pip is smart
+            # enough to deal with that
+            bootstrap.append(['sudo pip install ', path_dict])
 
-    #     # setup_cmds
-    #     for cmd in self._opts['bootstrap_cmds']:
-    #         if not isinstance(cmd, basestring):
-    #             cmd = cmd_line(cmd)
-    #         bootstrap.append([cmd])
+        # setup_cmds
+        for cmd in self._opts['bootstrap_cmds']:
+            if not isinstance(cmd, basestring):
+                cmd = cmd_line(cmd)
+            bootstrap.append([cmd])
 
-    #     # bootstrap_scripts
-    #     for path in self._opts['bootstrap_scripts']:
-    #         path_dict = parse_legacy_hash_path('file', path)
-    #         bootstrap.append([path_dict])
+        # bootstrap_scripts
+        for path in self._opts['bootstrap_scripts']:
+            path_dict = parse_legacy_hash_path('file', path)
+            bootstrap.append([path_dict])
 
-    #     return bootstrap
+        return bootstrap
 
-    # def _master_bootstrap_script_content(self, bootstrap):
-    #     """Create the contents of the master bootstrap script.
-    #     """
-    #     out = StringIO()
+    def _master_bootstrap_script_content(self, bootstrap):
+        """Create the contents of the master bootstrap script.
+        """
+        out = StringIO()
 
-    #     def writeln(line=''):
-    #         out.write(line + '\n')
+        def writeln(line=''):
+            out.write(line + '\n')
 
-    #     # shebang
-    #     sh_bin = self._opts['sh_bin']
-    #     if not sh_bin[0].startswith('/'):
-    #         sh_bin = ['/usr/bin/env'] + sh_bin
-    #     writeln('#!' + cmd_line(sh_bin))
-    #     writeln()
+        # shebang
+        sh_bin = self._opts['sh_bin']
+        if not sh_bin[0].startswith('/'):
+            sh_bin = ['/usr/bin/env'] + sh_bin
+        writeln('#!' + cmd_line(sh_bin))
+        writeln()
 
-    #     # store $PWD
-    #     writeln('# store $PWD')
-    #     writeln('__mrjob_PWD=$PWD')
-    #     writeln()
+        # store $PWD
+        writeln('# store $PWD')
+        writeln('__mrjob_PWD=$PWD')
+        writeln()
 
-    #     # download files using hadoop fs
-    #     writeln('# download files and mark them executable')
-    #     for name, path in sorted(
-    #             self._bootstrap_dir_mgr.name_to_path('file').iteritems()):
-    #         uri = self._upload_mgr.uri(path)
-    #         writeln('hadoop fs -copyToLocal %s $__mrjob_PWD/%s' %
-    #                 (pipes.quote(uri), pipes.quote(name)))
-    #         # make everything executable, like Hadoop Distributed Cache
-    #         writeln('chmod a+x $__mrjob_PWD/%s' % pipes.quote(name))
-    #     writeln()
+        # download files using hadoop fs
+        writeln('# download files and mark them executable')
+        for name, path in sorted(
+                self._bootstrap_dir_mgr.name_to_path('file').iteritems()):
+            uri = self._upload_mgr.uri(path)
+            writeln('hadoop fs -copyToLocal %s $__mrjob_PWD/%s' %
+                    (pipes.quote(uri), pipes.quote(name)))
+            # make everything executable, like Hadoop Distributed Cache
+            writeln('chmod a+x $__mrjob_PWD/%s' % pipes.quote(name))
+        writeln()
 
-    #     # run bootstrap commands
-    #     writeln('# bootstrap commands')
-    #     for cmd in bootstrap:
-    #         # reconstruct the command line, substituting $__mrjob_PWD/<name>
-    #         # for path dicts
-    #         line = ''
-    #         for token in cmd:
-    #             if isinstance(token, dict):
-    #                 # it's a path dictionary
-    #                 line += '$__mrjob_PWD/'
-    #                 line += pipes.quote(self._bootstrap_dir_mgr.name(**token))
-    #             else:
-    #                 # it's raw script
-    #                 line += token
-    #         writeln(line)
-    #     writeln()
+        # run bootstrap commands
+        writeln('# bootstrap commands')
+        for cmd in bootstrap:
+            # reconstruct the command line, substituting $__mrjob_PWD/<name>
+            # for path dicts
+            line = ''
+            for token in cmd:
+                if isinstance(token, dict):
+                    # it's a path dictionary
+                    line += '$__mrjob_PWD/'
+                    line += pipes.quote(self._bootstrap_dir_mgr.name(**token))
+                else:
+                    # it's raw script
+                    line += token
+            writeln(line)
+        writeln()
 
-    #     return out.getvalue()
+        return out.getvalue()
 
     def get_hadoop_version(self):
         return QUBOLE_HADOOP_VERSION
