@@ -168,8 +168,73 @@ def _lock_acquire_step_2(key, job_name):
 class LogFetchError(Exception):
     pass
 
+
 class QuboleError(Exception):
     pass
+
+
+class QuboleBootstrapAction(object):
+
+    def __init__(self, kargs):
+        self.script_path = kargs['script_path']
+        self.script_name = self.script_path.rsplit('/', 1)[1]
+        self.args = kargs['args']
+
+  # Simply takes an EMR style bootstrap action, and converts it to
+  # a "hadoop dfs -get" operation, and then an execute operation.
+  # This gets appended into the qubole node_boostrap script.
+    def append_action(self, output_file_path):
+        with open(output_file_path, 'a') as output_file:
+            output_file.write('hadoop dfs -get %s .\n' % self.script_path )
+            output_file.write('chmod a+rx ./%s\n' % self.script_name)
+            output_file.write('./%s %s\n' % (self.script_name, ''.join(self.args if self.args else '')))
+
+
+class QuboleBootstrapActionSet(object):
+
+    def __init__(self, kargs):
+        self.script_name = kargs['script_path']
+        self.bootstrap_actions = []
+
+    def add_bootstrap_action(self, kargs):
+        bootstrap_action = QuboleBootstrapAction(kargs)
+        self.bootstrap_actions.append(bootstrap_action)
+
+    def extract_hadoop_config(self):
+        hadoop_config = {}
+        for bootstrap_action in self.bootstrap_actions:
+            if 'configure-hadoop' == bootstrap_action.script_name:
+                hadoop_custom_config_args = bootstrap_action.args[0].replace('-s,', '').replace('-m,', '')
+                for entry in hadoop_custom_config_args.split(','):
+                    if entry:
+                        key_value_pair = entry.split('=')
+                        if len(key_value_pair) == 2:
+                            hadoop_config[key_value_pair[0]] = key_value_pair[1]
+        return hadoop_config
+
+    # similar to extract_hadoop_config,
+    # except we are going to return an array in the style of 'k0=v0\nk1=v1\n...'
+    def extract_hadoop_custom_config(self):
+        for bootstrap_action in self.bootstrap_actions:
+            if 'configure-hadoop' == bootstrap_action.script_name:
+                hadoop_custom_config_args = bootstrap_action.args[0].replace('-s,', '').replace('-m,', '').replace(',', '\n')
+                return hadoop_custom_config_args
+
+    # Used for custom code to be added to the node_bootstrap script.
+    # This would be stuff outside of the EMR style bootstrap actions.
+    def output_custom_code(self, code):
+        with open(self.script_name, 'a') as output_file:
+            output_file.write(code)
+            output_file.write('\n')
+
+        for bootstrap_action in self.bootstrap_actions:
+            if not 'configure-hadoop' == bootstrap_action.script_name:
+                bootstrap_action.append_action(self.script_name)
+
+    def output_code(self):
+        for bootstrap_action in self.bootstrap_actions:
+            if not 'configure-hadoop' == bootstrap_action.script_name:
+                bootstrap_action.append_action(self.script_name)
 
 class QuboleRunnerOptionStore(RunnerOptionStore):
 
@@ -192,6 +257,7 @@ class QuboleRunnerOptionStore(RunnerOptionStore):
         'aws_availability_zone',
         'aws_region',
         'qubole_bootstrap',
+        'bootstrap',
         'bootstrap_actions',
         'bootstrap_cmds',
         'bootstrap_files',
@@ -301,18 +367,18 @@ class QuboleJobRunner(MRJobRunner):
         s3_files_dir = self._s3_tmp_uri + 'files/'
         self._upload_mgr = UploadDirManager(s3_files_dir)
 
-        # Code commented out because we are not creating a bootstrap script. Instead, the --qubole-bootstrap option will work.
-        # # add the bootstrap files to a list of files to upload
-        # self._bootstrap_actions = []
-        # for action in self._opts['bootstrap_actions']:
-        #     args = shlex_split(action)
-        #     if not args:
-        #         raise ValueError('bad bootstrap action: %r' % (action,))
-        #     # don't use _add_bootstrap_file() because this is a raw bootstrap
-        #     self._bootstrap_actions.append({
-        #         'path': args[0],
-        #         'args': args[1:],
-        #     })
+        # add the bootstrap files to a list of files to upload
+        self._bootstrap_actions = []
+        for action in self._opts['bootstrap_actions']:
+            args = shlex_split(action)
+            if not args:
+                raise ValueError('bad bootstrap action: %r' % (action,))
+            # don't use _add_bootstrap_file() because this is a raw bootstrap
+            self._bootstrap_actions.append({
+                'script_path': args[0],
+                'args': args[1:],
+            })
+
 
         # for path in self._opts['bootstrap_files']:
         #     self._bootstrap_dir_mgr.add(**parse_legacy_hash_path(
@@ -554,10 +620,12 @@ class QuboleJobRunner(MRJobRunner):
 
         persistent -- set by make_persistent_job_flow()
         """
-        # lazily create mrjob.tar.gz
-        if self._opts['bootstrap_mrjob']:
-             self._create_mrjob_tar_gz()
-             self._bootstrap_dir_mgr.add('file', self._mrjob_tar_gz_path)
+
+        # Commenting this out. In Qubole, we'll just do a pip install
+        # # lazily create mrjob.tar.gz
+        # if self._opts['bootstrap_mrjob']:
+        #      self._create_mrjob_tar_gz()
+        #      self._bootstrap_dir_mgr.add('file', self._mrjob_tar_gz_path)
 
         # all other files needed by the script are already in
         # _bootstrap_dir_mgr
@@ -568,12 +636,16 @@ class QuboleJobRunner(MRJobRunner):
         # # the master bootstrap script
         self._create_master_bootstrap_script_if_needed()
         if self._master_bootstrap_script_path:
-        #     self._upload_mgr.add(self._master_bootstrap_script_path)
-              self._qubole_default_upload_mgr.add(self._master_bootstrap_script_path)
+                # add bootstrap_actions (basically convert them from EMR style to Qubole style)
+                qbasargs = {}
+                qbasargs['script_path'] = self._master_bootstrap_script_path
+                bootstrap_action_set = QuboleBootstrapActionSet(qbasargs)
+                for bootstrap_action in self._bootstrap_actions:
+                    bootstrap_action_set.add_bootstrap_action(bootstrap_action)
+                bootstrap_action_set.output_code()
+                # TODO: Take all the hadoop overrides and push that to the cluster config! For now we are just ignoring them
+                self._qubole_default_upload_mgr.add(self._master_bootstrap_script_path)
 
-        # make sure bootstrap action scripts are on S3
-        # for bootstrap_action in self._bootstrap_actions:
-        #     self._upload_mgr.add(bootstrap_action['path'])
 
         # # Add max-hours-idle script if we need it
         # if (self._opts['max_hours_idle'] and
@@ -966,10 +1038,6 @@ class QuboleJobRunner(MRJobRunner):
         path = os.path.join(self._get_local_tmp_dir(), self._opts['node_bootstrap_name'])
         log.info('writing master bootstrap script to %s' % path)
 
-        # contents = self._master_bootstrap_script_content(
-        #     self._bootstrap + mrjob_bootstrap + self._legacy_bootstrap)
-
-        # Just moving the order around to have the mrjob install first:
         contents = self._master_bootstrap_script_content(
             mrjob_bootstrap + self._bootstrap + self._legacy_bootstrap)
 
@@ -985,7 +1053,8 @@ class QuboleJobRunner(MRJobRunner):
         """Parse the *bootstrap* option with
         :py:func:`mrjob.setup.parse_setup_cmd()`.
         """
-        return [parse_setup_cmd(cmd) for cmd in self._opts['qubole_bootstrap']]
+        #return [parse_setup_cmd(cmd) for cmd in self._opts['qubole_bootstrap']]
+        return [parse_setup_cmd(cmd) for cmd in self._opts['bootstrap']]
 
     def _parse_legacy_bootstrap(self):
         """Parse the deprecated
