@@ -922,12 +922,12 @@ class QuboleJobRunner(MRJobRunner):
 
         """ Creating a Qubole Workflow Command (aka: CompositeCommand) ... """
         composite = CompositeCommand.compose(steps, cluster_label=self._opts['cluster_label'], notify=False, name=self._job_name)
-        log.info("### DEBUG - composite: %s" % composite)
+        log.debug("Qubole Composit Command: %s" % composite)
         composite_command = CompositeCommand.create(**composite)
         # CompositeCommand.run(**composite)
         self._qubole_job_start = time.time()
         log.info("Starting Qubole Command: %s" % composite_command.id)
-        log.info("Qubole UI Link: %s" % QUBOLE_ANALYZE_URL+str(composite_command.id))
+        log.info("Qubole UI Link: >>>  %s" % QUBOLE_ANALYZE_URL+str(composite_command.id))
         return composite_command
 
     def _wait_for_job_to_complete(self, composite_command):
@@ -995,9 +995,8 @@ class QuboleJobRunner(MRJobRunner):
         if self._master_bootstrap_script_path:
             return
 
-        # don't bother if we aren't creating a new Qubole cluster
-        if not self._opts['create_cluster']:
-            return
+        # TODO: Don't bother if the Qubole Cluster is still up!
+        # For now we just overwrite existing node_bootstrap.sh file ...
 
         # Also don't bother if we're not bootstrapping
         if not (self._bootstrap or self._legacy_bootstrap or
@@ -1054,7 +1053,10 @@ class QuboleJobRunner(MRJobRunner):
         :py:func:`mrjob.setup.parse_setup_cmd()`.
         """
         #return [parse_setup_cmd(cmd) for cmd in self._opts['qubole_bootstrap']]
-        return [parse_setup_cmd(cmd) for cmd in self._opts['bootstrap']]
+        if self._opts['bootstrap'] is not None:
+            return [parse_setup_cmd(cmd) for cmd in self._opts['bootstrap']]
+        else:
+            return []
 
     def _parse_legacy_bootstrap(self):
         """Parse the deprecated
@@ -1068,12 +1070,13 @@ class QuboleJobRunner(MRJobRunner):
         bootstrap = []
 
         # bootstrap_python_packages
-        if self._opts['bootstrap_python_packages']:
+        # this was breaking in qubole (Qubole already has pip installed)
+        #if self._opts['bootstrap_python_packages']:
             # 3.0.x AMIs use yum rather than apt-get;
             # can't determine which AMI `latest` is at
             # job flow creation time so we call both
-            bootstrap.append(['sudo apt-get install -y python-pip || '
-                'sudo yum install -y python-pip'])
+            #bootstrap.append(['sudo apt-get install -y python-pip || '
+            #    'sudo yum install -y python-pip'])
 
         for path in self._opts['bootstrap_python_packages']:
             path_dict = parse_legacy_hash_path('file', path)
@@ -1112,6 +1115,9 @@ class QuboleJobRunner(MRJobRunner):
         # store $PWD
         writeln('# store $PWD')
         writeln('__mrjob_PWD=$PWD')
+        # Qubole runs node bootstrap as root...need to check if the PWD = /
+        writeln('if [[ "$PWD" == *\/* ]]; then __mrjob_PWD=.$PWD')
+        writeln('fi')
         writeln()
 
         # download files using hadoop fs
